@@ -4,10 +4,8 @@
 
 {% block content %}
 <div class="narrow-wrap">
-  <!-- 返回上一页 -->
   <div class="back-bar">
-    <a href="javascript:void(0)" class="back-link"
-       onclick="history.length > 1 ? history.back() : location.href='{{ url_for('index') }}';">
+    <a href="{{ url_for('index') }}" class="back-link" data-back>
       {{ ui.icon("arrow-left", 15) }}<span>返回</span>
     </a>
     <a href="{{ url_for('index', section=post['section']) }}" class="back-sub">
@@ -15,7 +13,6 @@
     </a>
   </div>
 
-  <!-- 帖子正文 -->
   <div class="card post-detail">
     <div class="post-detail-head">
       {% if post['is_pinned'] %}
@@ -29,6 +26,9 @@
           <span>{{ post['nickname'] }}</span>
         </a>
         <span>发布于 {{ post['created_at'] | timeago }}</span>
+        {% if post['edited_at'] %}
+          <span>编辑于 {{ post['edited_at'] | timeago }}</span>
+        {% endif %}
         <span class="meta-stat">{{ ui.icon("eye", 13) }}{{ post['views'] }} 次浏览</span>
       </div>
     </div>
@@ -38,15 +38,29 @@
     <div class="post-detail-actions">
       <button id="like-btn" class="btn {{ 'btn-liked' if liked else 'btn-ghost' }}"
               data-post-id="{{ post['id'] }}"
-              data-login="{{ '1' if g.user else '0' }}">
+              data-login="{{ '1' if g.user else '0' }}"
+              aria-pressed="{{ 'true' if liked else 'false' }}">
         {{ ui.icon("heart", 16) }}
         <span id="like-count">{{ post['like_count'] }}</span>
         <span class="like-label">{{ '已赞' if liked else '点赞' }}</span>
       </button>
 
+      <button id="favorite-btn" class="btn {{ 'btn-faved' if favorited else 'btn-ghost' }}"
+              data-post-id="{{ post['id'] }}"
+              data-login="{{ '1' if g.user else '0' }}"
+              aria-pressed="{{ 'true' if favorited else 'false' }}">
+        {{ ui.icon("bookmark", 16) }}
+        <span id="favorite-count">{{ post['favorite_count'] }}</span>
+        <span class="favorite-label">{{ '已收藏' if favorited else '收藏' }}</span>
+      </button>
+
       {% if g.user and (g.user['id'] == post['user_id'] or g.user['is_admin']) %}
+      <a href="{{ url_for('edit_post', post_id=post['id']) }}" class="btn btn-ghost">
+        {{ ui.icon("edit", 15) }}编辑
+      </a>
       <form method="post" action="{{ url_for('delete_post', post_id=post['id']) }}"
             class="inline-form" data-confirm="确定删除这个帖子吗？">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn btn-ghost danger">
           {{ ui.icon("trash", 15) }}删除
         </button>
@@ -55,6 +69,7 @@
 
       {% if g.user and g.user['is_admin'] %}
       <form method="post" action="{{ url_for('toggle_pin', post_id=post['id']) }}" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn btn-ghost">
           {{ ui.icon("pin", 15) }}{{ '取消置顶' if post['is_pinned'] else '置顶' }}
         </button>
@@ -63,7 +78,6 @@
     </div>
   </div>
 
-  <!-- 评论区 -->
   <div class="card" id="comments">
     <h3 class="side-title">{{ ui.icon("chat", 15) }}全部评论
       <span class="count-pill">{{ comments | length }}</span>
@@ -71,13 +85,16 @@
 
     {% if g.user %}
     <form method="post" action="{{ url_for('add_comment', post_id=post['id']) }}" class="comment-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="parent_id" id="parent-id" value="">
       <div class="reply-tip" id="reply-tip" style="display:none">
         回复 <b id="reply-to"></b>
         <a href="javascript:void(0)" id="cancel-reply">取消</a>
       </div>
-      <textarea name="content" rows="3" required placeholder="友善发言，理性讨论…"></textarea>
+      <textarea name="content" id="comment-content" rows="3" required maxlength="1000"
+                placeholder="友善发言，理性讨论…"></textarea>
       <div class="comment-form-foot">
+        <span class="char-count" data-count-for="comment-content" data-max="1000">0/1000</span>
         <button type="submit" class="btn btn-primary">
           {{ ui.icon("chat", 14) }}发表评论
         </button>
@@ -111,6 +128,7 @@
             {% if g.user and (g.user['id'] == c['user_id'] or g.user['is_admin']) %}
             <form method="post" action="{{ url_for('delete_comment', comment_id=c['id']) }}"
                   class="inline-form" data-confirm="确定删除这条评论吗？">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <button type="submit" class="link-btn danger">删除</button>
             </form>
             {% endif %}

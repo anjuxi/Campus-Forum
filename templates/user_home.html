@@ -5,7 +5,6 @@
 {% block content %}
 {% set is_self = g.user and g.user['id'] == user['id'] %}
 <div class="narrow-wrap">
-  <!-- 用户信息卡 -->
   <div class="card profile-card">
     {{ ui.avatar(user['nickname'], user['avatar'], "xl") }}
     <div class="profile-info">
@@ -16,36 +15,70 @@
       {% if user['bio'] %}<p class="bio">{{ user['bio'] }}</p>{% endif %}
     </div>
     <div class="profile-stats">
-      <div><b>{{ posts | length }}</b><span>发帖</span></div>
-      <div><b>{{ comment_count }}</b><span>评论</span></div>
+      <div><b>{{ post_total }}</b><span>发帖</span></div>
+      <div><b>{{ comment_total }}</b><span>评论</span></div>
+      <div><b>{{ like_total }}</b><span>获赞</span></div>
     </div>
-    {% if g.user and g.user['id'] == user['id'] %}
+    {% if is_self %}
     <a href="{{ url_for('settings') }}" class="btn btn-ghost btn-sm">
       {{ ui.icon("settings", 14) }}编辑资料
     </a>
     {% endif %}
   </div>
 
-  <!-- TA 的帖子 -->
+  <div class="section-tabs card">
+    <a href="{{ url_for('user_home', user_id=user['id'], tab='posts') }}"
+       class="tab {{ 'active' if tab == 'posts' }}"
+       {% if tab == 'posts' %}aria-current="page"{% endif %}>
+      {{ ui.icon("pencil", 14) }}<span>{{ '我' if is_self else 'TA' }}的帖子</span>
+    </a>
+    <a href="{{ url_for('user_home', user_id=user['id'], tab='comments') }}"
+       class="tab {{ 'active' if tab == 'comments' }}"
+       {% if tab == 'comments' %}aria-current="page"{% endif %}>
+      {{ ui.icon("chat", 14) }}<span>{{ '我' if is_self else 'TA' }}的评论</span>
+    </a>
+  </div>
+
   <div class="card">
-    <h3 class="side-title">{{ ui.icon("pencil", 15) }}{{ '我' if is_self else 'TA' }}发布的帖子</h3>
-    {% if posts %}
-      <ul class="simple-post-list">
-        {% for p in posts %}
-        <li>
-          {{ ui.section_badge(p['section']) }}
-          <a href="{{ url_for('post_detail', post_id=p['id']) }}" class="title">{{ p['title'] }}</a>
-          <span class="muted">{{ p['created_at'] | timeago }}</span>
-          <span class="spacer"></span>
-          <span class="meta-stat">{{ ui.icon("eye", 12) }}{{ p['views'] }}</span>
-          <span class="meta-stat">{{ ui.icon("heart", 12) }}{{ p['like_count'] }}</span>
-          <span class="meta-stat">{{ ui.icon("chat", 12) }}{{ p['comment_count'] }}</span>
-        </li>
-        {% endfor %}
-      </ul>
+    {% if tab == 'posts' %}
+      {% if posts %}
+        <ul class="simple-post-list">
+          {% for p in posts %}
+          <li>
+            {{ ui.section_badge(p['section']) }}
+            <a href="{{ url_for('post_detail', post_id=p['id']) }}" class="title">{{ p['title'] }}</a>
+            <span class="muted">{{ p['created_at'] | timeago }}</span>
+            <span class="spacer"></span>
+            <span class="meta-stat">{{ ui.icon("eye", 12) }}{{ p['views'] }}</span>
+            <span class="meta-stat">{{ ui.icon("heart", 12) }}{{ p['like_count'] }}</span>
+            <span class="meta-stat">{{ ui.icon("chat", 12) }}{{ p['comment_count'] }}</span>
+          </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="muted">{{ '你' if is_self else 'TA' }}还没有发布过帖子</p>
+      {% endif %}
     {% else %}
-      <p class="muted">{{ '你' if is_self else 'TA' }}还没有发布过帖子</p>
+      {% if comments %}
+        <ul class="history-list">
+          {% for c in comments %}
+          <li class="history-item">
+            <div class="history-head">
+              <span class="muted">评论了</span>
+              <a href="{{ url_for('post_detail', post_id=c['post_id']) }}#comments" class="title">{{ c['post_title'] }}</a>
+              <span class="spacer"></span>
+              <span class="muted">{{ c['created_at'] | timeago }}</span>
+            </div>
+            <p class="history-content">{{ c['content'] | excerpt(100) }}</p>
+          </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="muted">{{ '你' if is_self else 'TA' }}还没有发表过评论</p>
+      {% endif %}
     {% endif %}
+
+    {{ ui.pager(page, total_pages, 'user_home', {'user_id': user['id'], 'tab': tab}) }}
   </div>
 </div>
 {% endblock %}

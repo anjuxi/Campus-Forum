@@ -13,10 +13,13 @@
       </div>
     </div>
     <form method="post">
-      <label>用户名</label>
-      <input type="text" name="username" required autofocus placeholder="请输入用户名">
-      <label>密码</label>
-      <input type="password" name="password" required placeholder="请输入密码">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label for="login-username">用户名</label>
+      <input id="login-username" type="text" name="username" required autofocus
+             autocomplete="username" maxlength="20" placeholder="请输入用户名">
+      <label for="login-password">密码</label>
+      <input id="login-password" type="password" name="password" required
+             autocomplete="current-password" maxlength="128" placeholder="请输入密码">
       <button type="submit" class="btn btn-primary btn-block">登录</button>
     </form>
     <p class="auth-switch">还没有账号？<a href="{{ url_for('register') }}">立即注册</a></p>

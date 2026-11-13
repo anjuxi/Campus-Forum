@@ -1,33 +1,37 @@
 # -*- coding: utf-8 -*-
-"""
-校园论坛主程序：基于 Flask + SQLite 的轻量级校园论坛。
-功能涵盖：注册登录、板块浏览、发帖、评论回复、点赞、搜索、
-热门排序、个人中心、管理员置顶与删除等。
-运行方式：python app.py ，然后浏览器访问 http://127.0.0.1:5000 。
-"""
+# 校园论坛，Flask + SQLite 的小站。
+# 启动：python app.py，浏览器打开 http://127.0.0.1:5000
 
-# ===== 依赖导入 =====
+import hmac;
 import os;
 import re;
+import secrets;
 import sqlite3;
+import time;
+from datetime import datetime, timedelta;
 from functools import wraps;
-from datetime import datetime;
+from urllib.parse import urlsplit;
 
 from flask import (
-    Flask, g, session, request, redirect, url_for,
-    render_template, flash, jsonify, abort,
+    Flask, abort, current_app, flash, g, jsonify, redirect,
+    render_template, request, session, url_for,
 );
-from werkzeug.security import generate_password_hash, check_password_hash;
+from werkzeug.security import check_password_hash, generate_password_hash;
 
-# ===== 常量定义 =====
-BASE_DIR = os.path.dirname(os.path.abspath(__file__));  # 项目根目录。
-DATABASE = os.path.join(BASE_DIR, "forum.db");          # SQLite 数据库文件路径。
-PAGE_SIZE = 15;                                         # 帖子列表每页条数。
+BASE_DIR = os.path.dirname(os.path.abspath(__file__));
+DEFAULT_DATABASE = os.path.join(BASE_DIR, "forum.db");
+PAGE_SIZE = 15;
+MAX_TITLE_LENGTH = 60;
+MAX_POST_CONTENT = 5000;
+MAX_COMMENT_LENGTH = 1000;
+MAX_BIO_LENGTH = 100;
+MAX_KEYWORD_LENGTH = 50;
+MAX_BODY_BYTES = 256 * 1024;  # 防止有人一次塞进超大表单。
+LOGIN_MAX_FAILURES = 5;
+LOGIN_LOCK_SECONDS = 300;
 
-# 板块列表：论坛固定的讨论分区。
 SECTIONS = ["学习交流", "校园生活", "二手交易", "失物招领", "活动通知", "灌水闲聊"];
 
-# 每个板块对应的图标名：模板中映射为线性 SVG 图标。
 SECTION_ICONS = {
     "学习交流": "book",
     "校园生活": "building",
@@ -37,84 +41,129 @@ SECTION_ICONS = {
     "灌水闲聊": "chat",
 };
 
-# 可选头像配色：头像显示昵称首字，颜色从这套暖粉调色板中选取。
 AVATARS = ["rose", "coral", "peach", "apricot", "amber", "blush", "mauve", "clay"];
 DEFAULT_AVATAR = "rose";
 
-# ===== 应用初始化 =====
-app = Flask(__name__);
-# 会话签名密钥：开发环境使用固定值，避免重启后登录态失效。
-app.config["SECRET_KEY"] = "campus-forum-secret-key-2024";
-# 让 Jinja 模板可以直接使用板块与图标常量。
-app.jinja_env.globals["SECTIONS"] = SECTIONS;
-app.jinja_env.globals["SECTION_ICONS"] = SECTION_ICONS;
-app.jinja_env.globals["AVATARS"] = AVATARS;
+# 登录失败按 IP + 用户名记在内存里，单机够用，重启就清空。
+LOGIN_FAILURES = {};
+
+SCHEMA_SQL = """
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        nickname TEXT NOT NULL,
+        avatar TEXT NOT NULL DEFAULT 'rose',
+        bio TEXT NOT NULL DEFAULT '',
+        is_admin INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        section TEXT NOT NULL,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        views INTEGER NOT NULL DEFAULT 0,
+        is_pinned INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        edited_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS comments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        parent_id INTEGER REFERENCES comments(id),
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS likes (
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, post_id)
+    );
+    CREATE TABLE IF NOT EXISTS favorites (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, post_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_posts_section ON posts(section);
+    CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_posts_pinned_created ON posts(is_pinned DESC, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_id);
+    CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id);
+    CREATE INDEX IF NOT EXISTS idx_comments_user ON comments(user_id);
+    CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_id);
+    CREATE INDEX IF NOT EXISTS idx_likes_post ON likes(post_id);
+    CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id);
+    CREATE INDEX IF NOT EXISTS idx_favorites_post ON favorites(post_id);
+""";
 
 
-# ===== 数据库连接管理 =====
+# 密钥优先取环境变量；没有就生成一份存到本地，避免把密钥写进代码。
+def load_secret_key():
+    env_key = os.environ.get("CAMPUS_SECRET_KEY", "").strip();
+    if env_key:
+        return env_key;
+    key_path = os.path.join(BASE_DIR, ".secret_key");
+    try:
+        if os.path.exists(key_path):
+            with open(key_path, "r", encoding="utf-8") as file:
+                saved = file.read().strip();
+            if saved:
+                return saved;
+        generated = secrets.token_hex(32);
+        with open(key_path, "w", encoding="utf-8") as file:
+            file.write(generated);
+        # chmod 在 Windows 上不一定生效，失败也就算了。
+        try:
+            os.chmod(key_path, 0o600);
+        except OSError:
+            pass;
+        return generated;
+    except OSError:
+        # 目录不可写时退回进程内随机密钥，重启后旧会话会失效。
+        return secrets.token_hex(32);
+
+
 def get_db():
-    """获取当前请求的数据库连接：同一请求内复用，避免重复连接。"""
+    # 每个请求复用同一个连接，顺便把 SQLite 的并发参数调一下。
     if "db" not in g:
-        g.db = sqlite3.connect(DATABASE);
-        g.db.row_factory = sqlite3.Row;  # 查询结果按列名访问。
-        g.db.execute("PRAGMA foreign_keys = ON");  # 开启外键约束。
+        g.db = sqlite3.connect(current_app.config["DATABASE"], timeout=5);
+        g.db.row_factory = sqlite3.Row;
+        g.db.execute("PRAGMA foreign_keys = ON");
+        g.db.execute("PRAGMA journal_mode = WAL");
+        g.db.execute("PRAGMA synchronous = NORMAL");
+        g.db.execute("PRAGMA busy_timeout = 5000");
     return g.db;
 
 
-@app.teardown_appcontext
-def close_db(exception):
-    """请求结束时自动关闭数据库连接。"""
+def close_db(exception=None):
     db = g.pop("db", None);
     if db is not None:
         db.close();
 
 
-def init_db():
-    """初始化数据表：首次运行时自动创建，重复执行不会报错。"""
-    db = sqlite3.connect(DATABASE);
-    db.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            nickname TEXT NOT NULL,
-            avatar TEXT NOT NULL DEFAULT 'rose',
-            bio TEXT NOT NULL DEFAULT '',
-            is_admin INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL REFERENCES users(id),
-            section TEXT NOT NULL,
-            title TEXT NOT NULL,
-            content TEXT NOT NULL,
-            views INTEGER NOT NULL DEFAULT 0,
-            is_pinned INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS comments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-            user_id INTEGER NOT NULL REFERENCES users(id),
-            parent_id INTEGER REFERENCES comments(id),
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS likes (
-            user_id INTEGER NOT NULL REFERENCES users(id),
-            post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (user_id, post_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_posts_section ON posts(section);
-        CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id);
-    """);
-    # 兼容旧数据：早期版本用 emoji 存头像，这里统一迁移为配色名。
+def ensure_column(db, table, column, ddl):
+    # 老库缺字段时补一列，表名和类型都来自代码里的固定值。
+    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")};
+    if column not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}");
+
+
+def init_db(database):
+    # 建表语句都带 IF NOT EXISTS，重复启动不会出问题。
+    db = sqlite3.connect(database);
+    db.row_factory = sqlite3.Row;
+    db.execute("PRAGMA foreign_keys = ON");
+    db.executescript(SCHEMA_SQL);
+    ensure_column(db, "posts", "edited_at", "TEXT");
+    # 早期版本拿 emoji 当头像，这里统一换成本项目的配色名。
+    placeholders = ",".join("?" * len(AVATARS));
     db.execute(
-        "UPDATE users SET avatar = ? WHERE avatar NOT IN ({})".format(
-            ",".join("?" * len(AVATARS))
-        ),
+        f"UPDATE users SET avatar = ? WHERE avatar NOT IN ({placeholders})",
         [DEFAULT_AVATAR] + AVATARS,
     );
     db.commit();
@@ -122,27 +171,108 @@ def init_db():
 
 
 def now_str():
-    """返回当前时间的字符串格式：统一用于写入数据库。"""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S");
 
 
-# ===== 用户认证相关 =====
-@app.before_request
-def load_current_user():
-    """每次请求前从会话中加载当前登录用户，存入 g.user。"""
+def register_hooks(app):
+    app.before_request(before_request_handler);
+    app.teardown_appcontext(close_db);
+    app.after_request(add_security_headers);
+
+
+def before_request_handler():
+    # 每个请求先把当前用户挂到 g 上，写操作再校验一下 CSRF。
     g.user = None;
     user_id = session.get("user_id");
     if user_id:
         g.user = get_db().execute(
             "SELECT * FROM users WHERE id = ?", (user_id,)
         ).fetchone();
-        # 用户被删除时清理失效会话。
         if g.user is None:
             session.clear();
+    # GET 不校验令牌，否则正常浏览也会被拦。
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        verify_csrf();
+
+
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff");
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN");
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin");
+    response.headers.setdefault(
+        "Permissions-Policy", "geolocation=(), microphone=(), camera=()"
+    );
+    # 页面只加载自己的静态资源，CSP 就按同源收紧。
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+        "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'",
+    );
+    return response;
+
+
+def get_csrf_token():
+    # token 放在 session 里，模板和表单都从这里取。
+    token = session.get("_csrf_token");
+    if not token:
+        token = secrets.token_urlsafe(32);
+        session["_csrf_token"] = token;
+    return token;
+
+
+def verify_csrf():
+    # 普通表单从字段取，fetch 请求从请求头取，两种都认。
+    expected = session.get("_csrf_token");
+    supplied = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token", "");
+    if not expected or not supplied or not hmac.compare_digest(str(expected), str(supplied)):
+        abort(400, description="请求校验失败，请刷新页面后重试");
+
+
+def login_attempt_key(username):
+    return f"{request.remote_addr or 'unknown'}|{(username or '').lower()}";
+
+
+def login_lock_remaining(key):
+    # 返回剩余秒数，0 表示没锁。
+    record = LOGIN_FAILURES.get(key);
+    if not record:
+        return 0;
+    count, unlock_at = record;
+    if unlock_at and time.monotonic() >= unlock_at:
+        LOGIN_FAILURES.pop(key, None);
+        return 0;
+    return int(unlock_at - time.monotonic()) if unlock_at else 0;
+
+
+def record_login_failure(key):
+    # 连续错 5 次锁 5 分钟，记录太多时顺手清掉过期项。
+    count = LOGIN_FAILURES.get(key, (0, 0))[0] + 1;
+    unlock_at = time.monotonic() + LOGIN_LOCK_SECONDS if count >= LOGIN_MAX_FAILURES else 0;
+    LOGIN_FAILURES[key] = (count, unlock_at);
+    if len(LOGIN_FAILURES) > 1000:
+        expired = [item for item, value in LOGIN_FAILURES.items()
+                   if value[1] and time.monotonic() >= value[1]];
+        for item in expired:
+            LOGIN_FAILURES.pop(item, None);
+
+
+def clear_login_failure(key):
+    LOGIN_FAILURES.pop(key, None);
+
+
+def safe_next_url(raw):
+    # 只放行站内路径，// 和反斜杠都按外链处理。
+    if not raw or not raw.startswith("/") or raw.startswith("//") or "\\" in raw:
+        return url_for("index");
+    parts = urlsplit(raw);
+    if parts.scheme or parts.netloc:
+        return url_for("index");
+    return raw;
 
 
 def login_required(view):
-    """登录校验装饰器：未登录访问时跳转到登录页。"""
+    # 未登录先提醒，再把原路径塞进 next。
     @wraps(view)
     def wrapped(*args, **kwargs):
         if g.user is None:
@@ -153,7 +283,6 @@ def login_required(view):
 
 
 def admin_required(view):
-    """管理员校验装饰器：仅管理员可用。"""
     @wraps(view)
     def wrapped(*args, **kwargs):
         if g.user is None or not g.user["is_admin"]:
@@ -162,10 +291,8 @@ def admin_required(view):
     return wrapped;
 
 
-# ===== 模板辅助函数 =====
-@app.template_filter("timeago")
 def timeago(value):
-    """时间显示过滤器：把时间字符串转成'几分钟前'这类友好形式。"""
+    # 时间戳换成「几分钟前」这种说法。
     try:
         dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S");
     except (ValueError, TypeError):
@@ -182,96 +309,114 @@ def timeago(value):
     return dt.strftime("%Y-%m-%d");
 
 
-@app.template_filter("excerpt")
 def excerpt(value, length=90):
-    """摘要过滤器：截取帖子正文前若干字符作为列表页预览。"""
+    # 列表页预览用，正文太长就截断加省略号。
     text = re.sub(r"\s+", " ", (value or "")).strip();
     if len(text) <= length:
         return text;
     return text[:length] + "…";
 
 
-# ===== 数据查询辅助 =====
-def get_post_with_stats(post_id):
-    """查询单个帖子及其作者、点赞数、评论数。"""
-    return get_db().execute("""
-        SELECT p.*, u.nickname, u.avatar, u.username,
-               (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
-               (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS comment_count
-        FROM posts p JOIN users u ON u.id = p.user_id
-        WHERE p.id = ?
-    """, (post_id,)).fetchone();
+def parse_page():
+    # 只认纯数字页码，其它一律当第一页，省得后面 int() 直接炸。
+    raw = request.args.get("page", "1").strip();
+    if not raw or len(raw) > 6 or not raw.isascii() or not raw.isdigit():
+        return 1;
+    return max(int(raw), 1);
+
+
+def page_count(total, size=PAGE_SIZE):
+    # 总页数至少是 1，模板那边就不用再判空。
+    return max((total + size - 1) // size, 1);
+
+
+def escape_like(text):
+    # 用户搜 % 或 _ 的时候不能当通配符使，先转义掉。
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
+
+
+def validate_post_fields(section, title, content):
+    # 返回第一条错误提示，全部合法就给 None。
+    if section not in SECTIONS:
+        return "请选择正确的板块！";
+    if not (2 <= len(title) <= MAX_TITLE_LENGTH):
+        return f"标题长度需在 2-{MAX_TITLE_LENGTH} 字之间！";
+    if len(content) < 5:
+        return "内容至少 5 个字！";
+    if len(content) > MAX_POST_CONTENT:
+        return f"内容不能超过 {MAX_POST_CONTENT} 字！";
+    return None;
+
+
+POST_LIST_FIELDS = """
+    p.*, u.nickname, u.avatar, u.username,
+    (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
+    (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS comment_count
+""";
+
+HOT_ORDER_SQL = """p.is_pinned DESC,
+    ((SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) * 5 +
+     (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) * 3 +
+     p.views) DESC, p.created_at DESC""";
 
 
 def get_hot_posts(limit=5):
-    """查询热门帖子：按点赞、评论、浏览量加权排序。"""
-    return get_db().execute("""
+    # 侧栏热门榜，点赞、评论、浏览量各给一个权重。
+    return get_db().execute(f"""
         SELECT p.id, p.title, p.views,
                (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
                (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS comment_count
         FROM posts p
-        ORDER BY (like_count * 5 + comment_count * 3 + p.views) DESC, p.created_at DESC
+        ORDER BY {HOT_ORDER_SQL}
         LIMIT ?
     """, (limit,)).fetchall();
 
 
 def get_site_stats():
-    """统计全站数据：用户数、帖子数、评论数。"""
-    db = get_db();
-    return {
-        "users": db.execute("SELECT COUNT(*) FROM users").fetchone()[0],
-        "posts": db.execute("SELECT COUNT(*) FROM posts").fetchone()[0],
-        "comments": db.execute("SELECT COUNT(*) FROM comments").fetchone()[0],
-    };
+    # 首页侧栏的全站数据，一条 SQL 拿齐。
+    row = get_db().execute("""
+        SELECT (SELECT COUNT(*) FROM users) AS users,
+               (SELECT COUNT(*) FROM posts) AS posts,
+               (SELECT COUNT(*) FROM comments) AS comments
+    """).fetchone();
+    return {"users": row["users"], "posts": row["posts"], "comments": row["comments"]};
 
 
-# ===== 页面路由：首页与帖子列表 =====
-@app.route("/")
 def index():
-    """首页：帖子列表，支持板块筛选、关键词搜索、最新/热门排序与分页。"""
+    # 首页帖子列表，板块、搜索、排序、分页都在这里处理。
     db = get_db();
-    section = request.args.get("section", "");       # 板块筛选。
-    keyword = request.args.get("q", "").strip();     # 搜索关键词。
-    sort = request.args.get("sort", "new");          # 排序方式：new 最新，hot 热门。
+    section = request.args.get("section", "").strip();
+    keyword = request.args.get("q", "").strip()[:MAX_KEYWORD_LENGTH];
+    sort = request.args.get("sort", "new");
+    if section not in SECTIONS:
+        section = "";  # 未知板块按「全部」处理，避免工具栏无选中项。
     if sort not in ("new", "hot"):
-        sort = "new";                                # 非法排序参数回落到最新，避免工具栏无选中项。
-    # 页码容错：非数字参数一律回落到第一页，避免非法输入导致 500。
-    page_arg = request.args.get("page", "1");
-    page = int(page_arg) if page_arg.isdigit() else 1;
-    page = max(page, 1);
+        sort = "new";  # 非法排序参数回落到最新。
+    page = parse_page();
 
-    # 动态拼接查询条件。
+    # 动态拼接查询条件，所有值都走参数化占位符。
     where = [];
     params = [];
-    if section in SECTIONS:
+    if section:
         where.append("p.section = ?");
         params.append(section);
     if keyword:
-        # 转义 LIKE 的通配符，避免搜索 "%"、"_" 时匹配到全部帖子。
-        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
+        escaped = escape_like(keyword);
         where.append("(p.title LIKE ? ESCAPE '\\' OR p.content LIKE ? ESCAPE '\\')");
         params.extend([f"%{escaped}%", f"%{escaped}%"]);
     where_sql = ("WHERE " + " AND ".join(where)) if where else "";
 
-    # 统计总数用于分页。
     total = db.execute(
         f"SELECT COUNT(*) FROM posts p {where_sql}", params
     ).fetchone()[0];
-    total_pages = max((total + PAGE_SIZE - 1) // PAGE_SIZE, 1);
+    total_pages = page_count(total);
     page = min(page, total_pages);
 
-    # 排序规则：置顶永远优先；热门按加权分数，最新按发布时间。
-    order_sql = "p.is_pinned DESC, p.created_at DESC";
-    if sort == "hot":
-        order_sql = """p.is_pinned DESC,
-                       ((SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) * 5 +
-                        (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) * 3 +
-                        p.views) DESC, p.created_at DESC""";
+    # 置顶永远排最前，热门按加权分数，最新按发布时间。
+    order_sql = HOT_ORDER_SQL if sort == "hot" else "p.is_pinned DESC, p.created_at DESC";
 
     posts = db.execute(f"""
-        SELECT p.*, u.nickname, u.avatar, u.username,
-               (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
-               (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS comment_count
+        SELECT {POST_LIST_FIELDS}
         FROM posts p JOIN users u ON u.id = p.user_id
         {where_sql}
         ORDER BY {order_sql}
@@ -285,10 +430,8 @@ def index():
     );
 
 
-# ===== 页面路由：注册 / 登录 / 退出 =====
-@app.route("/register", methods=["GET", "POST"])
 def register():
-    """注册：第一个注册的用户自动成为管理员。"""
+    # 第一个注册的用户自动给管理员。
     if g.user:
         return redirect(url_for("index"));
     if request.method == "POST":
@@ -297,13 +440,14 @@ def register():
         password = request.form.get("password", "");
         password2 = request.form.get("password2", "");
 
-        # 基础校验：用户名格式、昵称长度、密码长度、两次输入一致。
         if not re.fullmatch(r"[A-Za-z0-9_\u4e00-\u9fa5]{2,20}", username):
             flash("用户名需为 2-20 位字母、数字、下划线或中文！", "error");
         elif not (1 <= len(nickname) <= 20):
             flash("昵称长度需在 1-20 字之间！", "error");
         elif len(password) < 6:
             flash("密码长度至少 6 位！", "error");
+        elif len(password) > 128:
+            flash("密码长度不能超过 128 位！", "error");
         elif password != password2:
             flash("两次输入的密码不一致！", "error");
         else:
@@ -314,7 +458,6 @@ def register():
             if exists:
                 flash("该用户名已被注册！", "error");
             else:
-                # 首个注册用户授予管理员权限。
                 user_count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0];
                 is_admin = 1 if user_count == 0 else 0;
                 db.execute(
@@ -332,59 +475,48 @@ def register():
     return render_template("register.html");
 
 
-@app.route("/login", methods=["GET", "POST"])
 def login():
-    """登录：校验用户名与密码，成功后写入会话。"""
     if g.user:
         return redirect(url_for("index"));
     if request.method == "POST":
         username = request.form.get("username", "").strip();
         password = request.form.get("password", "");
-        user = get_db().execute(
-            "SELECT * FROM users WHERE username = ?", (username,)
-        ).fetchone();
-        if user and check_password_hash(user["password_hash"], password):
-            session.clear();
-            session["user_id"] = user["id"];
-            flash(f"欢迎回来，{user['nickname']}！", "success");
-            # 支持登录后跳回来源页面，但只允许站内相对路径，防止开放重定向。
-            # 反斜杠在部分浏览器会被当作斜杠，需一并拒绝（如 /\example.com）。
-            next_page = request.args.get("next") or "";
-            if (
-                not next_page.startswith("/")
-                or next_page.startswith("//")
-                or "\\" in next_page
-            ):
-                next_page = url_for("index");
-            return redirect(next_page);
-        flash("用户名或密码错误！", "error");
+        key = login_attempt_key(username);
+        wait = login_lock_remaining(key);
+        if wait:
+            flash(f"尝试次数过多，请 {wait} 秒后再试！", "error");
+        else:
+            user = get_db().execute(
+                "SELECT * FROM users WHERE username = ?", (username,)
+            ).fetchone();
+            if user and check_password_hash(user["password_hash"], password):
+                clear_login_failure(key);
+                session.clear();
+                session["user_id"] = user["id"];
+                session.permanent = True;
+                flash(f"欢迎回来，{user['nickname']}！", "success");
+                return redirect(safe_next_url(request.args.get("next", "")));
+            record_login_failure(key);
+            flash("用户名或密码错误！", "error");
     return render_template("login.html");
 
 
-@app.route("/logout")
 def logout():
-    """退出登录：清空会话。"""
+    # 只接受 POST，防止别的页面用 GET 链接把人踢下线。
     session.clear();
     flash("你已退出登录！", "success");
     return redirect(url_for("index"));
 
 
-# ===== 页面路由：发帖与帖子详情 =====
-@app.route("/post/new", methods=["GET", "POST"])
 @login_required
 def new_post():
-    """发布新帖子。"""
     if request.method == "POST":
         section = request.form.get("section", "");
         title = request.form.get("title", "").strip();
         content = request.form.get("content", "").strip();
-
-        if section not in SECTIONS:
-            flash("请选择正确的板块！", "error");
-        elif not (2 <= len(title) <= 60):
-            flash("标题长度需在 2-60 字之间！", "error");
-        elif len(content) < 5:
-            flash("内容至少 5 个字！", "error");
+        error = validate_post_fields(section, title, content);
+        if error:
+            flash(error, "error");
         else:
             db = get_db();
             cur = db.execute(
@@ -398,22 +530,56 @@ def new_post():
     return render_template("new_post.html");
 
 
-@app.route("/post/<int:post_id>")
-def post_detail(post_id):
-    """帖子详情页：浏览量 +1，展示正文与全部评论。"""
+@login_required
+def edit_post(post_id):
+    # 作者本人或管理员才能改。
     db = get_db();
-    # 先确认帖子存在，再自增浏览量，避免对不存在的 id 反复写库。
+    post = db.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone();
+    if post is None:
+        abort(404);
+    if post["user_id"] != g.user["id"] and not g.user["is_admin"]:
+        abort(403);
+
+    if request.method == "POST":
+        section = request.form.get("section", "");
+        title = request.form.get("title", "").strip();
+        content = request.form.get("content", "").strip();
+        error = validate_post_fields(section, title, content);
+        if error:
+            flash(error, "error");
+        else:
+            db.execute(
+                """UPDATE posts SET section = ?, title = ?, content = ?, edited_at = ?
+                   WHERE id = ?""",
+                (section, title, content, now_str(), post_id),
+            );
+            db.commit();
+            flash("帖子已更新！", "success");
+            return redirect(url_for("post_detail", post_id=post_id));
+        # 校验失败时回显用户刚提交的内容，而不是数据库里的旧内容。
+        post = dict(post);
+        post.update({"section": section, "title": title, "content": content});
+    return render_template("edit_post.html", post=post);
+
+
+def post_detail(post_id):
+    # 进来先把浏览量加一，再取正文和评论。
+    db = get_db();
     exists = db.execute("SELECT 1 FROM posts WHERE id = ?", (post_id,)).fetchone();
     if exists is None:
         abort(404);
     db.execute("UPDATE posts SET views = views + 1 WHERE id = ?", (post_id,));
     db.commit();
 
-    post = get_post_with_stats(post_id);
+    post = db.execute(f"""
+        SELECT {POST_LIST_FIELDS},
+               (SELECT COUNT(*) FROM favorites f WHERE f.post_id = p.id) AS favorite_count
+        FROM posts p JOIN users u ON u.id = p.user_id
+        WHERE p.id = ?
+    """, (post_id,)).fetchone();
     if post is None:
         abort(404);
 
-    # 查询评论：附带作者信息与被回复评论的作者昵称。
     comments = db.execute("""
         SELECT c.*, u.nickname, u.avatar, u.username,
                pu.nickname AS parent_nickname
@@ -425,24 +591,26 @@ def post_detail(post_id):
         ORDER BY c.created_at ASC
     """, (post_id,)).fetchall();
 
-    # 当前用户是否已点赞。
     liked = False;
+    favorited = False;
     if g.user:
         liked = db.execute(
             "SELECT 1 FROM likes WHERE user_id = ? AND post_id = ?",
             (g.user["id"], post_id),
         ).fetchone() is not None;
+        favorited = db.execute(
+            "SELECT 1 FROM favorites WHERE user_id = ? AND post_id = ?",
+            (g.user["id"], post_id),
+        ).fetchone() is not None;
 
     return render_template(
-        "post_detail.html", post=post, comments=comments, liked=liked,
+        "post_detail.html", post=post, comments=comments,
+        liked=liked, favorited=favorited,
     );
 
 
-# ===== 操作路由：评论 / 点赞 / 删除 / 置顶 =====
-@app.route("/post/<int:post_id>/comment", methods=["POST"])
 @login_required
 def add_comment(post_id):
-    """发表评论：支持回复某条评论（@ 功能）。"""
     db = get_db();
     post = db.execute("SELECT id FROM posts WHERE id = ?", (post_id,)).fetchone();
     if post is None:
@@ -462,6 +630,8 @@ def add_comment(post_id):
                 parent_id = None;
     if len(content) < 2:
         flash("评论至少 2 个字！", "error");
+    elif len(content) > MAX_COMMENT_LENGTH:
+        flash(f"评论不能超过 {MAX_COMMENT_LENGTH} 字！", "error");
     else:
         db.execute(
             """INSERT INTO comments (post_id, user_id, parent_id, content, created_at)
@@ -473,10 +643,9 @@ def add_comment(post_id):
     return redirect(url_for("post_detail", post_id=post_id) + "#comments");
 
 
-@app.route("/post/<int:post_id>/like", methods=["POST"])
 @login_required
 def toggle_like(post_id):
-    """点赞/取消点赞：JSON 接口，前端无刷新切换。"""
+    # 前端 fetch 调这个接口，返回最新状态和总数。
     db = get_db();
     post = db.execute("SELECT id FROM posts WHERE id = ?", (post_id,)).fetchone();
     if post is None:
@@ -494,7 +663,7 @@ def toggle_like(post_id):
         liked = False;
     else:
         db.execute(
-            "INSERT INTO likes (user_id, post_id, created_at) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO likes (user_id, post_id, created_at) VALUES (?, ?, ?)",
             (g.user["id"], post_id, now_str()),
         );
         liked = True;
@@ -505,10 +674,39 @@ def toggle_like(post_id):
     return jsonify({"liked": liked, "count": count});
 
 
-@app.route("/post/<int:post_id>/delete", methods=["POST"])
+@login_required
+def toggle_favorite(post_id):
+    # 和点赞一个套路，只是换成收藏表。
+    db = get_db();
+    post = db.execute("SELECT id FROM posts WHERE id = ?", (post_id,)).fetchone();
+    if post is None:
+        abort(404);
+
+    existing = db.execute(
+        "SELECT 1 FROM favorites WHERE user_id = ? AND post_id = ?",
+        (g.user["id"], post_id),
+    ).fetchone();
+    if existing:
+        db.execute(
+            "DELETE FROM favorites WHERE user_id = ? AND post_id = ?",
+            (g.user["id"], post_id),
+        );
+        favorited = False;
+    else:
+        db.execute(
+            "INSERT OR IGNORE INTO favorites (user_id, post_id, created_at) VALUES (?, ?, ?)",
+            (g.user["id"], post_id, now_str()),
+        );
+        favorited = True;
+    db.commit();
+    count = db.execute(
+        "SELECT COUNT(*) FROM favorites WHERE post_id = ?", (post_id,)
+    ).fetchone()[0];
+    return jsonify({"favorited": favorited, "count": count});
+
+
 @login_required
 def delete_post(post_id):
-    """删除帖子：仅作者本人或管理员可操作。"""
     db = get_db();
     post = db.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone();
     if post is None:
@@ -523,10 +721,8 @@ def delete_post(post_id):
     return redirect(url_for("index"));
 
 
-@app.route("/post/<int:post_id>/pin", methods=["POST"])
 @admin_required
 def toggle_pin(post_id):
-    """置顶/取消置顶：仅管理员可操作。"""
     db = get_db();
     post = db.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone();
     if post is None:
@@ -538,10 +734,8 @@ def toggle_pin(post_id):
     return redirect(url_for("post_detail", post_id=post_id));
 
 
-@app.route("/comment/<int:comment_id>/delete", methods=["POST"])
 @login_required
 def delete_comment(comment_id):
-    """删除评论：仅评论作者或管理员可操作。"""
     db = get_db();
     comment = db.execute(
         "SELECT * FROM comments WHERE id = ?", (comment_id,)
@@ -558,46 +752,97 @@ def delete_comment(comment_id):
     return redirect(url_for("post_detail", post_id=comment["post_id"]) + "#comments");
 
 
-# ===== 页面路由：个人中心与设置 =====
-@app.route("/user/<int:user_id>")
 def user_home(user_id):
-    """用户主页：展示用户信息及其发布的帖子。"""
+    # 资料、发帖、评论三块，帖子区和评论区分页各算各的。
     db = get_db();
     user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone();
     if user is None:
         abort(404);
-    posts = db.execute("""
-        SELECT p.*,
-               (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
-               (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS comment_count
-        FROM posts p WHERE p.user_id = ?
-        ORDER BY p.created_at DESC
-    """, (user_id,)).fetchall();
-    comment_count = db.execute(
+
+    tab = request.args.get("tab", "posts");
+    if tab not in ("posts", "comments"):
+        tab = "posts";
+    page = parse_page();
+
+    post_total = db.execute(
+        "SELECT COUNT(*) FROM posts WHERE user_id = ?", (user_id,)
+    ).fetchone()[0];
+    comment_total = db.execute(
         "SELECT COUNT(*) FROM comments WHERE user_id = ?", (user_id,)
     ).fetchone()[0];
+    like_total = db.execute(
+        """SELECT COUNT(*) FROM likes l JOIN posts p ON p.id = l.post_id
+           WHERE p.user_id = ?""", (user_id,)
+    ).fetchone()[0];
+
+    posts = [];
+    comments = [];
+    if tab == "posts":
+        total_pages = page_count(post_total);
+        page = min(page, total_pages);
+        posts = db.execute(f"""
+            SELECT {POST_LIST_FIELDS}
+            FROM posts p JOIN users u ON u.id = p.user_id
+            WHERE p.user_id = ?
+            ORDER BY p.created_at DESC
+            LIMIT ? OFFSET ?
+        """, (user_id, PAGE_SIZE, (page - 1) * PAGE_SIZE)).fetchall();
+    else:
+        total_pages = page_count(comment_total);
+        page = min(page, total_pages);
+        comments = db.execute("""
+            SELECT c.*, p.title AS post_title, p.section AS post_section
+            FROM comments c JOIN posts p ON p.id = c.post_id
+            WHERE c.user_id = ?
+            ORDER BY c.created_at DESC
+            LIMIT ? OFFSET ?
+        """, (user_id, PAGE_SIZE, (page - 1) * PAGE_SIZE)).fetchall();
+
     return render_template(
-        "user_home.html", user=user, posts=posts, comment_count=comment_count,
+        "user_home.html", user=user, tab=tab, page=page, total_pages=total_pages,
+        post_total=post_total, comment_total=comment_total, like_total=like_total,
+        posts=posts, comments=comments,
     );
 
 
-@app.route("/settings", methods=["GET", "POST"])
+@login_required
+def favorites():
+    db = get_db();
+    page = parse_page();
+    total = db.execute(
+        "SELECT COUNT(*) FROM favorites WHERE user_id = ?", (g.user["id"],)
+    ).fetchone()[0];
+    total_pages = page_count(total);
+    page = min(page, total_pages);
+    posts = db.execute(f"""
+        SELECT {POST_LIST_FIELDS}
+        FROM favorites f
+        JOIN posts p ON p.id = f.post_id
+        JOIN users u ON u.id = p.user_id
+        WHERE f.user_id = ?
+        ORDER BY f.created_at DESC
+        LIMIT ? OFFSET ?
+    """, (g.user["id"], PAGE_SIZE, (page - 1) * PAGE_SIZE)).fetchall();
+    return render_template(
+        "favorites.html", posts=posts, total=total,
+        page=page, total_pages=total_pages,
+    );
+
+
 @login_required
 def settings():
-    """个人设置：修改昵称、头像、签名与密码。"""
     db = get_db();
     if request.method == "POST":
         action = request.form.get("action");
 
         if action == "profile":
-            # 修改基础资料。
             nickname = request.form.get("nickname", "").strip();
             avatar = request.form.get("avatar", DEFAULT_AVATAR);
             bio = request.form.get("bio", "").strip();
             if not (1 <= len(nickname) <= 20):
                 flash("昵称长度需在 1-20 字之间！", "error");
-            elif len(bio) > 100:
-                flash("个性签名不能超过 100 字！", "error");
+            elif len(bio) > MAX_BIO_LENGTH:
+                flash(f"个性签名不能超过 {MAX_BIO_LENGTH} 字！", "error");
             else:
                 if avatar not in AVATARS:
                     avatar = DEFAULT_AVATAR;
@@ -609,7 +854,7 @@ def settings():
                 flash("资料已更新！", "success");
 
         elif action == "password":
-            # 修改密码：需要先验证旧密码。
+            # 改密码得先验证原密码。
             old = request.form.get("old_password", "");
             new = request.form.get("new_password", "");
             new2 = request.form.get("new_password2", "");
@@ -617,6 +862,8 @@ def settings():
                 flash("原密码不正确！", "error");
             elif len(new) < 6:
                 flash("新密码长度至少 6 位！", "error");
+            elif len(new) > 128:
+                flash("新密码长度不能超过 128 位！", "error");
             elif new != new2:
                 flash("两次输入的新密码不一致！", "error");
             else:
@@ -631,26 +878,98 @@ def settings():
     return render_template("settings.html");
 
 
-# ===== 错误页面 =====
-@app.errorhandler(404)
-def page_not_found(e):
-    """404：页面不存在。"""
+def page_not_found(error):
     return render_template("error.html", code=404, message="页面不存在或已被删除"), 404;
 
 
-@app.errorhandler(403)
-def forbidden(e):
-    """403：没有操作权限。"""
+def forbidden(error):
     return render_template("error.html", code=403, message="你没有权限执行此操作"), 403;
 
 
-# ===== 启动入口 =====
+def bad_request(error):
+    message = getattr(error, "description", "") or "请求无效，请刷新页面后重试";
+    return render_template("error.html", code=400, message=message), 400;
+
+
+def payload_too_large(error):
+    return render_template("error.html", code=413, message="提交的内容过长，请精简后重试"), 413;
+
+
+def server_error(error):
+    # 不让堆栈直接暴露给用户。
+    return render_template("error.html", code=500, message="服务器开小差了，请稍后再试"), 500;
+
+
+def register_error_handlers(app):
+    app.register_error_handler(400, bad_request);
+    app.register_error_handler(403, forbidden);
+    app.register_error_handler(404, page_not_found);
+    app.register_error_handler(413, payload_too_large);
+    app.register_error_handler(500, server_error);
+
+
+def register_routes(app):
+    # endpoint 写死，模板里的 url_for 就不用跟着改。
+    app.add_url_rule("/", "index", index, methods=["GET"]);
+    app.add_url_rule("/register", "register", register, methods=["GET", "POST"]);
+    app.add_url_rule("/login", "login", login, methods=["GET", "POST"]);
+    app.add_url_rule("/logout", "logout", logout, methods=["POST"]);
+    app.add_url_rule("/post/new", "new_post", new_post, methods=["GET", "POST"]);
+    app.add_url_rule("/post/<int:post_id>", "post_detail", post_detail, methods=["GET"]);
+    app.add_url_rule("/post/<int:post_id>/edit", "edit_post", edit_post, methods=["GET", "POST"]);
+    app.add_url_rule("/post/<int:post_id>/comment", "add_comment", add_comment, methods=["POST"]);
+    app.add_url_rule("/post/<int:post_id>/like", "toggle_like", toggle_like, methods=["POST"]);
+    app.add_url_rule("/post/<int:post_id>/favorite", "toggle_favorite", toggle_favorite, methods=["POST"]);
+    app.add_url_rule("/post/<int:post_id>/delete", "delete_post", delete_post, methods=["POST"]);
+    app.add_url_rule("/post/<int:post_id>/pin", "toggle_pin", toggle_pin, methods=["POST"]);
+    app.add_url_rule("/comment/<int:comment_id>/delete", "delete_comment", delete_comment, methods=["POST"]);
+    app.add_url_rule("/user/<int:user_id>", "user_home", user_home, methods=["GET"]);
+    app.add_url_rule("/favorites", "favorites", favorites, methods=["GET"]);
+    app.add_url_rule("/settings", "settings", settings, methods=["GET", "POST"]);
+
+
+def create_app(test_config=None):
+    app = Flask(__name__);
+    app.config.update(
+        SECRET_KEY=load_secret_key(),
+        DATABASE=os.environ.get("CAMPUS_DATABASE", "").strip() or DEFAULT_DATABASE,
+        MAX_CONTENT_LENGTH=MAX_BODY_BYTES,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=os.environ.get("CAMPUS_COOKIE_SECURE") == "1",
+        PERMANENT_SESSION_LIFETIME=timedelta(days=14),
+    );
+    if test_config:
+        app.config.update(test_config);
+
+    # 让 Jinja 模板可以直接使用板块、头像与 CSRF 令牌。
+    app.jinja_env.globals.update(
+        SECTIONS=SECTIONS,
+        SECTION_ICONS=SECTION_ICONS,
+        AVATARS=AVATARS,
+        csrf_token=get_csrf_token,
+    );
+    app.template_filter("timeago")(timeago);
+    app.template_filter("excerpt")(excerpt);
+
+    register_hooks(app);
+    register_routes(app);
+    register_error_handlers(app);
+
+    # 建应用时顺手把表建好，两种启动方式都能直接用。
+    with app.app_context():
+        init_db(app.config["DATABASE"]);
+    return app;
+
+
+app = create_app();
+
+
 if __name__ == "__main__":
-    init_db();  # 启动前确保数据表存在。
-    print("——" * 50);
+    print("——"*50);
     print("校园论坛已启动！");
     print("请在浏览器访问：http://127.0.0.1:5000 ！");
     print("第一位注册的用户将自动成为管理员！");
-    print("——" * 50);
+    print("——"*50);
     app.run(host="127.0.0.1", port=5000, debug=False);
     print("✅ 校园论坛服务已结束！");

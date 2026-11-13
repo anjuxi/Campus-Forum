@@ -1,381 +1,159 @@
 # Campus Forum
 
-[![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Flask](https://img.shields.io/badge/Flask-3.1-000000?logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
-[![Jinja2](https://img.shields.io/badge/Jinja2-3.x-B41717?logo=jinja&logoColor=white)](https://jinja.palletsprojects.com/)
-[![SQLite](https://img.shields.io/badge/SQLite-3-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
-[![Werkzeug](https://img.shields.io/badge/Werkzeug-3.x-000000)](https://werkzeug.palletsprojects.com/)
-[![HTML5](https://img.shields.io/badge/HTML5-E34F26?logo=html5&logoColor=white)](https://developer.mozilla.org/en-US/docs/Web/HTML)
-[![CSS3](https://img.shields.io/badge/CSS3-1572B6?logo=css3&logoColor=white)](https://developer.mozilla.org/en-US/docs/Web/CSS)
-[![JavaScript](https://img.shields.io/badge/JavaScript-ES6-F7DF1E?logo=javascript&logoColor=black)](https://developer.mozilla.org/en-US/docs/Web/JavaScript)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](https://www.python.org/downloads/)
+**English** | [简体中文](README.zh-CN.md)
 
-A lightweight campus forum based on Flask + SQLite. Single-file backend, zero frontend build, zero external CDN, and ready to run out of the box. It includes registration and login, section browsing, posting, comments and replies, likes, search, popular sorting, user profiles, profile and password settings, as well as admin pinning and content management.
+A small campus forum built with Flask and SQLite. All backend code lives in `app.py`. The frontend is a set of Jinja2 templates plus hand-written CSS and JavaScript, with no bundler, no npm and no CDN.
 
----
+![首页](首页.png)
 
-## Table of Contents
+## Introduction
 
-- [Features](#features)
-- [Tech Stack and Dependencies](#tech-stack-and-dependencies)
-- [Project Structure](#project-structure)
-- [Quick Start](#quick-start)
-- [Pages and Operations](#pages-and-operations)
-- [Route Overview](#route-overview)
-- [Database Design](#database-design)
-- [System Architecture](#system-architecture)
-- [Security and Robustness Design](#security-and-robustness-design)
-- [Configuration](#configuration)
-- [FAQ](#faq)
-- [Known Limitations](#known-limitations)
-- [Author and Contact](#author-and-contact)
+The forum is meant for a class or a club, so the setup stays small: one Python process and one `forum.db` file. Copying that file is enough to back up or move the whole site.
 
----
+Accounts work with username and password. The first account registered on a fresh database becomes the administrator. After that, users can post in six sections, comment and reply, like, favorite, search, and edit their own posts.
 
-## Features
+Each user gets a profile page with separate post and comment tabs, a favorites page, and a settings page for nickname, avatar color and bio. Administrators can pin posts and delete any post or comment.
 
-### Accounts
-- Register, log in, and log out
-- Username 2–20 characters (letters, digits, underscores, or Chinese characters); password at least 6 characters
-- Nickname 1–20 characters; bio up to 100 characters
-- 8 avatar color schemes; avatars are displayed as "first character of nickname + color block"; no image uploads
-- The first registered user automatically becomes an administrator
-- Changing the password requires verifying the original password
+The interface has a light/dark toggle remembered in `localStorage`, and the layout collapses to a single column on narrow screens.
 
-### Content
-- 6 fixed sections: Study Exchange, Campus Life, Second-hand Trading, Lost and Found, Event Announcements, Off-Topic Chat
-- Create posts (section + title 2–60 characters + content at least 5 characters)
-- Post detail, view count, sorting by latest/popular
-- Comments and second-level replies (when replying to a comment, show "Reply to @nickname")
-- Like / unlike, with refresh-free frontend toggle (returns JSON)
-- Keyword search (title + content)
-- Pagination, 15 items per page
+## Dependencies
 
-### Management and Personal Center
-- Authors can delete their own posts/comments; administrators can delete any post/comment
-- Administrators can pin/unpin posts
-- User profile displays profile, post count, comment count, and post list
-- Personal settings support editing nickname, avatar color scheme, bio, and password
-
-### Interaction and Visuals
-- The navigation bar always shows a "Logout" button; the post detail page provides "← Back" and "Back to section"
-- Top navigation search box, section tabs, sort toggle, pagination
-- Flash messages automatically fade out after 3 seconds
-- Confirmation before deletion
-- Responsive layout with breakpoints at 900px / 620px
-
----
-
-## Tech Stack and Dependencies
-
-### Runtime Dependencies
-
-| Dependency | Version Requirement | Description |
-| --- | --- | --- |
-| Python | 3.9+ (development environment 3.11.9) | Runtime interpreter |
-| Flask | >= 3.0 (development environment 3.1.3, see `requirements.txt`) | Web framework and routing |
-| Werkzeug | Installed with Flask | `generate_password_hash` / `check_password_hash` password hashing |
-| Jinja2 | Installed with Flask | Template engine and custom filters (`timeago`, `excerpt`) |
-| SQLite | Python built-in `sqlite3` | Data storage, no extra installation required |
-| HTML5 / CSS3 / JavaScript (ES6) | Natively supported by browsers | Frontend, no framework, no bundler, no CDN |
-
-The frontend does not depend on any third-party libraries: styles are hand-written in `static/css/style.css`, interactions are hand-written in `static/js/main.js`, and icons are inline SVGs generated by template macros.
-
-### Installation
-
-```bash
-# 1. Create and activate a virtual environment (optional, but recommended)
-python -m venv .venv
-# Windows PowerShell
-.venv\Scripts\Activate.ps1
-# macOS / Linux
-source .venv/bin/activate
-
-# 2. Install dependencies
-pip install -r requirements.txt
-```
-
-Contents of `requirements.txt`:
+Runtime:
 
 ```text
 flask>=3.0
 ```
 
----
+Development:
+
+```text
+-r requirements.txt
+pytest>=8.0
+```
+
+Python 3.9 or newer. `sqlite3` is part of the standard library, so there is nothing else to install. The frontend uses no third-party packages at all.
 
 ## Project Structure
 
 ```text
-校园论坛/
-├── app.py                  # All backend logic: database, auth, routes, template filters
-├── forum.db                # SQLite database (auto-created on first launch)
-├── requirements.txt        # Python dependency declaration
+.
+├── app.py                  # config, database, auth, routes, filters
+├── forum.db                # created on first run
+├── .secret_key             # generated on first run, gitignored
+├── requirements.txt
+├── requirements-dev.txt
+├── templates/
+│   ├── base.html           # layout, navbar, flash messages
+│   ├── _ui.html            # icon, avatar, badge and pager macros
+│   ├── _post_form.html     # form shared by new and edit
+│   ├── index.html
+│   ├── post_detail.html
+│   ├── new_post.html
+│   ├── edit_post.html
+│   ├── favorites.html
+│   ├── user_home.html
+│   ├── settings.html
+│   ├── login.html
+│   ├── register.html
+│   └── error.html
 ├── static/
-│   ├── css/
-│   │   └── style.css       # Site-wide styles (solid colors, thin borders, no gradients)
-│   ├── js/
-│   │   └── main.js         # Flash fade-out, delete confirmation, likes, comment replies
-│   └── favicon.svg         # Site icon (inline SVG)
-└── templates/
-    ├── base.html           # Base layout: navbar, Flash, footer
-    ├── _ui.html            # Macro library: linear icon icon / text avatar avatar / section badge
-    ├── index.html          # Home: section tabs, sorting, post list, sidebar, pagination
-    ├── post_detail.html    # Detail: back button, content, likes, comments and replies
-    ├── new_post.html       # New post
-    ├── user_home.html      # User profile
-    ├── settings.html       # Profile and password settings
-    ├── login.html          # Login
-    ├── register.html       # Register
-    └── error.html          # 403 / 404 error page
+│   ├── css/style.css
+│   ├── js/main.js
+│   └── favicon.svg
+└── tests/
+    └── test_app.py
 ```
 
----
+## Usage
 
-## Quick Start
+Install and start:
 
 ```bash
-# Run in the project root directory
+pip install -r requirements.txt
 python app.py
 ```
 
-After startup, the terminal outputs:
+Then open <http://127.0.0.1:5000>. Tables are created on startup, so there is no separate initialization step.
 
-```text
-——————————————————————————————————————————————
-Campus Forum has started!
-Please visit in your browser: http://127.0.0.1:5000 !
-The first registered user will automatically become an administrator!
-——————————————————————————————————————————————
-```
+To clear all data, stop the server, delete `forum.db`, and start again.
 
-Visit <http://127.0.0.1:5000> in your browser. First register an account (the first registered account becomes the administrator), and then you can post, comment, and like.
+A few things can be changed through environment variables:
 
-![Screenshot](<屏幕截图 2026-10-29 185701.png>)
+- `CAMPUS_DATABASE` sets the database file path.
+- `CAMPUS_SECRET_KEY` sets the session secret. Without it, a key is generated into `.secret_key` on first run.
+- `CAMPUS_COOKIE_SECURE=1` marks the session cookie as `Secure`, which you want when the site runs over HTTPS.
 
-### Database Initialization and Reset
-
-- On first run of `python app.py`, table creation logic (`init_db()`) runs automatically; no manual database creation is needed.
-- To clear all data: stop the service, delete `forum.db` in the project root directory, and start again to recreate the database.
-- Legacy emoji avatar data from older versions is automatically migrated to color scheme names (such as `rose`) at startup, without errors.
-
-### Changing the Port
-
-By default, it listens on `127.0.0.1:5000`. To change the port, edit the end of [app.py](app.py):
+To use another port, change the last line of `app.py`:
 
 ```python
 app.run(host="127.0.0.1", port=5000, debug=False);
 ```
 
----
+### Pages and routes
 
-## Pages and Operations
-
-| Page | Path | Description |
+| Method | Path | Notes |
 | --- | --- | --- |
-| Home | `/` | Section filtering, keyword search, latest/popular sorting, pagination, forum overview and popular discussions |
-| Post Detail | `/post/<id>` | Content, views, likes, delete (if authorized), pin (admin), comments and replies |
-| New Post | `/post/new` | Choose a section, fill in title and content |
-| User Profile | `/user/<id>` | Profile, post count, comment count, and the user's post list |
-| Personal Settings | `/settings` | Edit nickname, avatar color scheme, bio; separate form for password change |
-| Login / Register | `/login`, `/register` | Logged-in visitors are automatically redirected back to home |
-| Error Page | 403 / 404 | Unified error message and entry back to home |
+| GET | `/` | Post list, accepts `section`, `q`, `sort`, `page` |
+| GET, POST | `/register` | |
+| GET, POST | `/login` | Accepts an in-site `next` parameter |
+| POST | `/logout` | |
+| GET, POST | `/post/new` | Login required |
+| GET | `/post/<id>` | Increments the view count |
+| GET, POST | `/post/<id>/edit` | Author or admin |
+| POST | `/post/<id>/comment` | Login required |
+| POST | `/post/<id>/like` | Returns JSON |
+| POST | `/post/<id>/favorite` | Returns JSON |
+| POST | `/post/<id>/delete` | Author or admin |
+| POST | `/post/<id>/pin` | Admin only |
+| POST | `/comment/<id>/delete` | Author or admin |
+| GET | `/user/<id>` | `tab=posts` or `tab=comments` |
+| GET | `/favorites` | Login required |
+| GET, POST | `/settings` | Login required |
 
-UI highlights:
+Visiting a protected page while logged out shows a message and redirects to `/login?next=...`. Insufficient permissions return 403.
 
-- Home section switching uses "text + bottom underline" tabs; the selected item shows a pink underline.
-- Post cards show author avatar, section badge, title, excerpt, time, and views/likes/comments counts.
-- The top-left of the post detail page always shows a "← Back" button (prefer browser history, otherwise home), with "Back to [current section]" next to it.
-- Logged-in users can see the "Logout" button directly in the navigation bar (icon + text); the settings entry is a gear icon.
-- If not logged in, liking redirects to the login page; after login, it automatically returns to the original page.
+### Database
 
----
+There are five tables: `users`, `posts`, `comments`, `likes` and `favorites`. Every request connection enables foreign keys, WAL, `synchronous=NORMAL` and a five second busy timeout. Likes and favorites use a composite primary key, so a user can only like or favorite a post once. Replies are stored through `comments.parent_id`, which allows one level of nesting.
 
-## Route Overview
+`init_db()` uses `CREATE TABLE IF NOT EXISTS`, so an existing database keeps working. The only migration it does is adding `posts.edited_at` to older databases that lack the column.
 
-| Method | Path | Function | Permission |
-| --- | --- | --- | --- |
-| GET | `/` | Post list (section / search / sort / pagination) | Public |
-| GET, POST | `/register` | Register | Not logged in |
-| GET, POST | `/login` | Login (supports in-site `next` redirect) | Not logged in |
-| GET | `/logout` | Log out | Public |
-| GET, POST | `/post/new` | Publish post | Login required |
-| GET | `/post/<id>` | Post detail (views +1) | Public |
-| POST | `/post/<id>/comment` | Post comment / reply | Login required |
-| POST | `/post/<id>/like` | Toggle like, returns JSON | Login required |
-| POST | `/post/<id>/delete` | Delete post | Author or admin |
-| POST | `/post/<id>/pin` | Pin / unpin | Admin |
-| POST | `/comment/<id>/delete` | Delete comment | Author or admin |
-| GET | `/user/<id>` | User profile | Public |
-| GET, POST | `/settings` | Edit profile / password | Login required |
+### Security
 
-When not logged in and accessing protected pages, a Flash message is written and the user is redirected to `/login?next=original_path`; insufficient permissions return a 403 page.
+CSRF tokens live in the session and are exposed through `<meta name="csrf-token">`. Forms submit them as a hidden field, JSON requests send `X-CSRF-Token`. A missing or wrong token returns 400.
 
----
+Login failures are counted per IP and username in memory. Five failures lock that pair for five minutes. The counter is cleared on restart and is not shared between worker processes.
 
-## Database Design
+Every response includes `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy` and a same-origin CSP. Passwords are stored as Werkzeug hashes. All SQL is parameterized, and `%`, `_` and `\` are escaped before a `LIKE` search. The login `next` parameter only accepts in-site paths starting with a single `/`.
 
-Four tables: `users`, `posts`, `comments`, `likes`. Foreign key constraints are enabled on each request connection via `PRAGMA foreign_keys = ON`.
+Post and comment bodies are rendered as plain text with `white-space: pre-wrap`, never as HTML.
 
-```mermaid
-erDiagram
-    users ||--o{ posts : "publishes"
-    users ||--o{ comments : "writes"
-    users ||--o{ likes : "likes"
-    posts ||--o{ comments : "has"
-    posts ||--o{ likes : "liked by"
-    comments ||--o{ comments : "replies to"
+### Tests
 
-    users {
-        INTEGER id PK
-        TEXT username
-        TEXT password_hash
-        TEXT nickname
-        TEXT avatar
-        TEXT bio
-        INTEGER is_admin
-        TEXT created_at
-    }
-
-    posts {
-        INTEGER id PK
-        INTEGER user_id FK
-        TEXT section
-        TEXT title
-        TEXT content
-        INTEGER views
-        INTEGER is_pinned
-        TEXT created_at
-    }
-
-    comments {
-        INTEGER id PK
-        INTEGER post_id FK
-        INTEGER user_id FK
-        INTEGER parent_id FK
-        TEXT content
-        TEXT created_at
-    }
-
-    likes {
-        INTEGER user_id FK
-        INTEGER post_id FK
-        TEXT created_at
-    }
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests -q
 ```
 
-Field descriptions:
+The suite covers registration and the admin rule, login and lockout, CSRF rejection, post creation and editing, permissions, comments and replies, likes, favorites, search escaping, bad page numbers, security headers, XSS escaping, admin actions and the profile tabs. All 19 cases pass.
 
-| Table | Field | Type | Description |
-| --- | --- | --- | --- |
-| `users` | `id` | INTEGER PK | Auto-increment primary key |
-| | `username` | TEXT UNIQUE | Login name, unique |
-| | `password_hash` | TEXT | Password hashed by Werkzeug; plaintext is not stored |
-| | `nickname` | TEXT | Display nickname |
-| | `avatar` | TEXT | Avatar color scheme name, default `rose` |
-| | `bio` | TEXT | Bio, default empty string |
-| | `is_admin` | INTEGER | 1 means administrator; the first registered user is 1 |
-| | `created_at` | TEXT | `YYYY-MM-DD HH:MM:SS` |
-| `posts` | `user_id` | INTEGER FK | Author, references `users.id` |
-| | `section` | TEXT | Section name, constrained by backend whitelist |
-| | `views` | INTEGER | View count |
-| | `is_pinned` | INTEGER | Whether pinned |
-| `comments` | `post_id` | INTEGER FK | Post it belongs to, `ON DELETE CASCADE` |
-| | `parent_id` | INTEGER FK | Comment being replied to, self-reference, nullable |
-| `likes` | `user_id` + `post_id` | Composite primary key | A user can like a post only once |
+## Contributing
 
-Indexes: `idx_posts_section(section)`, `idx_comments_post(post_id)`. Times are stored uniformly as `%Y-%m-%d %H:%M:%S` strings and displayed by the `timeago` filter as "just now / minutes ago / hours ago / days ago / date".
+Issues and pull requests are welcome. Before changing something, read through `app.py` first; it is ordered by request lifecycle: config, database, hooks, permission decorators, helpers, routes.
 
----
+Please run the tests before sending a patch:
 
-## System Architecture
-
-```mermaid
-flowchart LR
-    B[Browser<br/>HTML / CSS / JS] -->|HTTP request| F[Flask app app.py]
-    F -->|Render| T[Jinja2 templates<br/>templates/*.html]
-    F -->|Return static files| S[static/<br/>style.css · main.js · favicon.svg]
-    F -->|Parameterized SQL| D[(SQLite<br/>forum.db)]
-    T -->|HTML| B
-    S -->|CSS / JS / SVG| B
+```bash
+python -m pytest tests -q
 ```
 
-Request handling flow:
+The built-in Flask server is for local use only. For anything public, put it behind a WSGI server such as Gunicorn or uWSGI and set `CAMPUS_SECRET_KEY`.
 
-1. `before_request` reads `user_id` from the session and loads the current user into `g.user`.
-2. View functions obtain a connection reused within the same request via `get_db()` (enables foreign keys, `Row` row factory).
-3. `login_required` / `admin_required` decorators enforce permission checks.
-4. Views query data and pass it to Jinja2 templates for rendering; templates reuse the icon and avatar macros from `_ui.html`.
-5. At request end, `teardown_appcontext` closes the database connection.
+## Contact
 
----
-
-## Security and Robustness Design
-
-- **Passwords**: Only the result of `generate_password_hash` is stored; login checks with `check_password_hash`.
-- **SQL injection**: All queries use parameterized placeholders; dynamic conditions only concatenate whitelisted fields.
-- **Search wildcards**: Escape `%`, `_`, and `\` and use `ESCAPE '\'` to avoid searching `%` matching all posts.
-- **Open redirect**: Login `next` only allows in-site paths starting with a single `/`, and rejects `//` and backslash forms.
-- **XSS**: Templates auto-escape by default; content is rendered as plain text (`white-space: pre-wrap` preserves line breaks), with no HTML rendering.
-- **Unauthorized access**: Deleting posts/comments verifies author or administrator identity; pinning is admin-only; unauthorized access returns 403.
-- **Foreign key constraints**: Before deleting a post, comment self-references are cleared first; before deleting a comment, child comment references are cleared first, avoiding constraint failures during cascade; post comments and likes are cleaned by `ON DELETE CASCADE`.
-- **Input validation**: Username format, nickname length, password length, title length, content length, bio length, section whitelist, and `parent_id` ownership are all validated server-side, not relying on the frontend.
-- **Parameter tolerance**: Invalid page numbers (such as `?page=abc`), invalid sort parameters, unknown sections, and forged cross-post reply targets degrade safely without 500 errors.
-- **Session cleanup**: After a user is deleted, the next request clears the invalid session.
-
----
-
-## Configuration
-
-| Configuration | Location | Current Value | Description |
-| --- | --- | --- | --- |
-| `SECRET_KEY` | `app.py` | `campus-forum-secret-key-2024` | Session signing key; replace with an environment variable before production deployment |
-| `DATABASE` | `app.py` | `project_root/forum.db` | SQLite file path |
-| `PAGE_SIZE` | `app.py` | `15` | Number of items per page |
-| `SECTIONS` | `app.py` | 6 sections | Section whitelist, also drives home tabs and new post options |
-| `AVATARS` | `app.py` | 8 color schemes | Available avatar color schemes |
-| Listen address / port | End of `app.py` | `127.0.0.1:5000` | Development server listen parameters |
-
----
-
-## FAQ
-
-**Q: `Address already in use` on startup?**
-A: Port 5000 is occupied. End the occupying process, or change the `app.run` port.
-
-```powershell
-# Windows: find and kill the process occupying port 5000
-Get-NetTCPConnection -LocalPort 5000 -State Listen | Select-Object -ExpandProperty OwningProcess
-Stop-Process -Id <PID> -Force
-```
-
-**Q: Why am I not an administrator after registering?**
-A: Only the first registered account in the database is granted administrator permissions.
-
-**Q: I changed a template or `app.py`, but the page does not change?**
-A: The project runs with `debug=False`, so the service must be restarted; for pure CSS/JS changes, force-refresh the browser cache (Windows `Ctrl+F5`).
-
-**Q: Why can't I see emoji in the UI?**
-A: This is an intentional design choice. All icons are inline SVGs generated by the `icon` macro in `templates/_ui.html`; avatars are solid color blocks with the first character of the nickname.
-
-**Q: Where is the data stored? Can it be exported?**
-A: All data is in the single `forum.db` file, which can be opened, backed up, or exported with any SQLite client.
-
----
-
-## Known Limitations
-
-- Uses Flask's built-in development server, suitable only for local running and learning demonstrations, not for direct public exposure. For production deployment, use a WSGI server such as Gunicorn / uWSGI.
-- CSRF Token, login failure rate limiting, attachment upload, and rich text editing are not implemented.
-- No automated test files are provided; during development, Flask `test_client` with a temporary database was used for regression verification of registration/login, redirect interception, posting/commenting, unauthorized access, post/comment deletion, JSON like toggling, etc.
-- The session secret is hardcoded in the source code and should be read from an environment variable before deployment.
-
----
-
-## Author and Contact
-
-**Dr. Ailan Anjuxi (谙弆悕)**
+Ailan Anjuxi (谙弆悕博士)
 
 - Email: [anjuxi.ME@outlook.com](mailto:anjuxi.ME@outlook.com)
-- SIP phone: [sip:anjuxi@sip.linphone.org](sip:anjuxi@sip.linphone.org)
+- SIP: [sip:anjuxi@sip.linphone.org](sip:anjuxi@sip.linphone.org)
 
-This project is for personal learning and teaching demonstration purposes. Discussion and corrections are welcome.
+Written for learning and classroom demos. Released under the MIT license, see [LICENSE](LICENSE).

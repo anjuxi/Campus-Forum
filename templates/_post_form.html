@@ -1,0 +1,35 @@
+{# 新建和编辑共用这个表单，form_post 为空就是新建 #}
+<form method="post" action="{{ form_action }}" class="post-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+  <label>选择板块</label>
+  <div class="section-picker">
+    {% for s in SECTIONS %}
+    <label class="section-option">
+      <input type="radio" name="section" value="{{ s }}"
+             {{ 'checked' if (form_post and form_post['section'] == s) or (not form_post and loop.first) }}>
+      <span>{{ ui.icon(SECTION_ICONS[s], 14) }}{{ s }}</span>
+    </label>
+    {% endfor %}
+  </div>
+
+  <label for="post-title">标题</label>
+  <input id="post-title" type="text" name="title" required maxlength="60"
+         placeholder="一句话说清楚，2-60 字"
+         value="{{ form_post['title'] if form_post else '' }}">
+  <div class="field-foot">
+    <span class="char-count" data-count-for="post-title" data-max="60">0/60</span>
+  </div>
+
+  <label for="post-content">内容</label>
+  <textarea id="post-content" name="content" rows="10" required maxlength="5000"
+            placeholder="详细描述一下…">{{ form_post['content'] if form_post else '' }}</textarea>
+  <div class="field-foot">
+    <span class="char-count" data-count-for="post-content" data-max="5000">0/5000</span>
+  </div>
+
+  <div class="form-actions">
+    <a href="{{ cancel_url }}" class="btn btn-ghost">取消</a>
+    <button type="submit" class="btn btn-primary">{{ submit_label }}</button>
+  </div>
+</form>

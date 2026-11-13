@@ -17,3 +17,9 @@ forum.db-shm
 
 # 环境变量与密钥
 .env
+.secret_key
+
+# 测试与覆盖率缓存
+.pytest_cache/
+.coverage
+htmlcov/
